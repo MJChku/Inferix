@@ -116,8 +116,8 @@ class SelfForcingKVCacheManager:
         Args:
             kv_cache_manager: The underlying KV cache manager
             kv_cache_request: KV cache request object
-            start_index: Start index in the cache
-            length: Length of data to retrieve
+            read_length: Required prefix in the stored cache layout (after
+                Ulysses redistribution). None copies the entire allocation.
             
         Returns:
             KV cache tensor with shape compatible with original implementation
