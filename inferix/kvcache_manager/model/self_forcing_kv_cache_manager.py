@@ -109,22 +109,33 @@ class SelfForcingKVCacheManager:
             # Reset cross-attention cache (simulating original is_init=False)
             pass  # The underlying manager handles this
 
-    def get_kv_cache(self, kv_cache_manager: KVCacheManager, kv_cache_request: KVCacheRequest) -> torch.Tensor:
+    def get_kv_cache(self, kv_cache_manager: KVCacheManager, kv_cache_request: KVCacheRequest, read_length: int | None = None) -> torch.Tensor:
         """
         Get KV cache data for a specific range.
         
         Args:
             kv_cache_manager: The underlying KV cache manager
             kv_cache_request: KV cache request object
-            start_index: Start index in the cache
-            length: Length of data to retrieve
+            read_length: Required prefix in the stored cache layout (after
+                Ulysses redistribution). None copies the entire allocation.
             
         Returns:
             KV cache tensor with shape compatible with original implementation
         """
-        return kv_cache_manager.get(
-            kv_cache_request, f"layer_{self.layer_number}",
-        ).squeeze(2)
+        if read_length is None:
+            return kv_cache_manager.get(
+                kv_cache_request, f"layer_{self.layer_number}",
+            ).squeeze(2)
+        source = kv_cache_manager.get_raw(kv_cache_request, f"layer_{self.layer_number}")
+        if not 0 <= read_length <= source.shape[1]:
+            raise ValueError(f"invalid KV history length {read_length}")
+        # Keep the allocated capacity: attention's eviction decisions use it.
+        # The current block overwrites the uncopied range before attention.
+        cache = torch.empty(source.shape, dtype=source.dtype, device=kv_cache_manager.device)
+        if read_length:
+            cache[0, :read_length].copy_(source[0, :read_length])
+            cache[1, :read_length].copy_(source[1, :read_length])
+        return cache.squeeze(2)
 
     def set_kv_cache(self, kv_cache_manager: KVCacheManager, kv_cache_request: KVCacheRequest, 
                     start_index: int, k_data: torch.Tensor, v_data: torch.Tensor) -> None:

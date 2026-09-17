@@ -270,15 +270,17 @@ class CausalWanSelfAttention(nn.Module):
                 roped_key = causal_rope_apply(
                     k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
-            # TODO(fty): This is a hack to make the current_start consistent with cp
-            if self.parallel_config is not None:
-                current_start = current_start // self.parallel_config.world_size
-                cache_start = cache_start // self.parallel_config.world_size
-            current_end = current_start + roped_query.shape[1]
-            sink_tokens = self.sink_size * frame_seqlen
+            # The cache stores post-Ulysses tensors: tokens are partitioned
+            # across ring ranks, heads across Ulysses ranks.
+            distributed = self.parallel_config is not None and self.parallel_config.world_size > 1
+            ring_size = self.parallel_config.ring_size if distributed else 1
+            ulysses_size = self.parallel_config.ulysses_size if distributed else 1
+            current_start = current_start // ring_size
+            num_new_tokens = roped_query.shape[1] * ulysses_size
+            current_end = current_start + num_new_tokens
+            sink_tokens = self.sink_size * frame_seqlen // ring_size
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache_meta["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
             if self.local_attn_size != -1 and (current_end > kv_cache_meta["global_end_index"].item()) and (
                     num_new_tokens + kv_cache_meta["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
@@ -294,17 +296,20 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index = kv_cache_meta["local_end_index"].item() + current_end - \
                     kv_cache_meta["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
+                # Rolling changes historical positions as well as new tokens.
+                kv_cache_meta["_writeback_start"] = min(sink_tokens, local_start_index)
             else:
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache_meta["local_end_index"].item() + current_end - kv_cache_meta["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
+                kv_cache_meta["_writeback_start"] = local_start_index
             
-            # Update KV cache with new keys/values
-            kv_cache_meta["k"][:, local_start_index:local_end_index] = roped_key
-            kv_cache_meta["v"][:, local_start_index:local_end_index] = v
-            
-            # For single GPU (no parallel_config or world_size == 1), use standard attention with full cache
-            if self.parallel_config is None or self.parallel_config.world_size <= 1:
+            # CoreAttention writes redistributed keys/values for multiple GPUs.
+            # Before that exchange, their head and token layout differs from
+            # the cache, so only the single-GPU path writes them here.
+            if not distributed:
+                kv_cache_meta["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache_meta["v"][:, local_start_index:local_end_index] = v
                 # Use the cached keys/values up to local_end_index
                 full_k = kv_cache_meta["k"][:, :local_end_index]
                 full_v = kv_cache_meta["v"][:, :local_end_index]
@@ -412,7 +417,14 @@ class CausalWanAttentionBlock(nn.Module):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
         # assert e[0].dtype == torch.float32
 
-        # Fetch self-attention kv cache    
+        # Transfer ranges use the same post-Ulysses layout as self-attention.
+        bounded_kv = self.enable_kv_offload
+        distributed = self.parallel_config is not None and self.parallel_config.world_size > 1
+        ring_size = self.parallel_config.ring_size if distributed else 1
+        ulysses_size = self.parallel_config.ulysses_size if distributed else 1
+        cache_start_index = current_start // ring_size
+        cache_num_tokens = x.shape[1] * ulysses_size
+        # Fetch self-attention kv cache
         if kv_cache_meta is not None:
             assert kv_cache_manager is not None
             assert kv_cache_requests is not None
@@ -420,7 +432,22 @@ class CausalWanAttentionBlock(nn.Module):
             all_k_cache = []
             all_v_cache = []
             for kv_cache_request in kv_cache_requests:
-                kv_cache = self.kv_cache_manager.get_kv_cache(kv_cache_manager=kv_cache_manager, kv_cache_request=kv_cache_request)
+                read_length = None
+                if bounded_kv:
+                    capacity = kv_cache_manager.get_raw(
+                        kv_cache_request, f"layer_{self.kv_cache_manager.layer_number}").shape[1]
+                    old_local_end = kv_cache_meta["local_end_index"].item()
+                    old_global_end = kv_cache_meta["global_end_index"].item()
+                    evicts = self.local_attn_size != -1 and (
+                        cache_start_index + cache_num_tokens > old_global_end) and (
+                        cache_num_tokens + old_local_end > capacity)
+                    # Eviction needs the old history to perform the existing
+                    # roll. Otherwise the current block replaces its own KV.
+                    read_length = (old_local_end if evicts else
+                                   old_local_end + cache_start_index - old_global_end)
+                kv_cache = self.kv_cache_manager.get_kv_cache(
+                    kv_cache_manager=kv_cache_manager, kv_cache_request=kv_cache_request,
+                    read_length=read_length)
                 all_k_cache.append(kv_cache[0])
                 all_v_cache.append(kv_cache[1])
             k_cache = torch.stack(all_k_cache, dim=0)
@@ -437,8 +464,12 @@ class CausalWanAttentionBlock(nn.Module):
         # Set self-attention kv cache
         if kv_cache_meta is not None:
             for request_idx, kv_cache_request in enumerate(kv_cache_requests):
-                cur_k_cache, cur_v_cache = new_k[request_idx], new_v[request_idx]
-                self.kv_cache_manager.set_kv_cache(kv_cache_manager=kv_cache_manager, kv_cache_request=kv_cache_request, start_index=0, k_data=cur_k_cache, v_data=cur_v_cache)
+                write_start = kv_cache_meta["_writeback_start"] if bounded_kv else 0
+                if not 0 <= write_start <= new_k.shape[1]:
+                    raise ValueError(f"invalid KV writeback offset {write_start}")
+                cur_k_cache = new_k[request_idx, write_start:]
+                cur_v_cache = new_v[request_idx, write_start:]
+                self.kv_cache_manager.set_kv_cache(kv_cache_manager=kv_cache_manager, kv_cache_request=kv_cache_request, start_index=write_start, k_data=cur_k_cache, v_data=cur_v_cache)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
